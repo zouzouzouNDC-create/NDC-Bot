@@ -1,59 +1,112 @@
-import { SlashCommandBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } from 'discord.js';
-import { successEmbed, infoEmbed } from '../../utils/embeds.js';
-import { logger } from '../../utils/logger.js';
-import { InteractionHelper } from '../../utils/interactionHelper.js';
+import { EmbedBuilder, MessageFlags } from 'discord.js';
+import { logger } from '../../../utils/logger.js';
+import { getColor } from '../../../config/bot.js';
+import { InteractionHelper } from '../../../utils/interactionHelper.js';
+import { pendingSubmissions } from '../../../commands/Community/submit.js';
 
-// Stockage temporaire le temps que l'utilisateur remplisse le modal
-export const pendingSubmissions = new Map();
+function buildEmbed(title, description, color) {
+  return new EmbedBuilder()
+    .setTitle(title)
+    .setDescription(description)
+    .setColor(color);
+}
 
 export default {
-  data: new SlashCommandBuilder()
-    .setName('submit')
-    .setDescription('Partage une création dans un salon')
-    .addAttachmentOption(option =>
-      option.setName('fichier')
-        .setDescription('Le fichier à partager')
-        .setRequired(true))
-    .addChannelOption(option =>
-      option.setName('salon')
-        .setDescription('Salon de destination')
-        .setRequired(true))
-    .addIntegerOption(option =>
-      option.setName('reacts')
-        .setDescription('Réactions requises avant publication')
-        .setRequired(true)
-        .setMinValue(1)),
-  category: 'Community',
+  name: 'submitModal',
 
-  async execute(interaction, config, client) {
-    const fichier = interaction.options.getAttachment('fichier');
-    const salon = interaction.options.getChannel('salon');
-    const reactsRequis = interaction.options.getInteger('reacts');
+  async execute(interaction, client, args) {
+    const pending = pendingSubmissions.get(interaction.user.id);
 
-    pendingSubmissions.set(interaction.user.id, { fichier, salon, reactsRequis });
+    if (!pending) {
+      await InteractionHelper.safeReply(interaction, {
+        embeds: [buildEmbed(
+          '⚠️ Session expirée',
+          'Relance la commande /submit pour recommencer.',
+          getColor('warning'),
+        )],
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
 
-    const modal = new ModalBuilder()
-      .setCustomId('submitModal')
-      .setTitle('Détails de la soumission');
+    const description = interaction.fields.getTextInputValue('description')?.trim();
+    const preuve = interaction.fields.getTextInputValue('preuve')?.trim() || 'Non fournie';
 
-    const descriptionInput = new TextInputBuilder()
-      .setCustomId('description')
-      .setLabel('Description de ce que tu partages')
-      .setStyle(TextInputStyle.Paragraph)
-      .setRequired(true);
+    if (!description) {
+      await InteractionHelper.safeReply(interaction, {
+        embeds: [buildEmbed(
+          '⚠️ Description manquante',
+          'Merci de fournir une description avant de soumettre.',
+          getColor('warning'),
+        )],
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
 
-    const preuveInput = new TextInputBuilder()
-      .setCustomId('preuve')
-      .setLabel('Lien vers une preuve (photo/vidéo)')
-      .setStyle(TextInputStyle.Short)
-      .setRequired(false);
+    const deferred = await InteractionHelper.safeDefer(interaction, { flags: MessageFlags.Ephemeral });
+    if (!deferred) {
+      return;
+    }
 
-    modal.addComponents(
-      new ActionRowBuilder().addComponents(descriptionInput),
-      new ActionRowBuilder().addComponents(preuveInput)
+    const voteEmbed = buildEmbed(
+      'Nouvelle soumission en attente de validation',
+      `**Description :** ${description}\n**Preuve :** ${preuve}\n**Auteur :** <@${interaction.user.id}>\n**Réactions requises :** ${pending.reactsRequis} ✅`,
+      getColor('info'),
     );
 
-    await interaction.showModal(modal);
-    logger.debug(`Submit modal shown to user ${interaction.user.id} in guild ${interaction.guildId}`);
+    let voteMessage;
+    try {
+      voteMessage = await interaction.channel.send({
+        embeds: [voteEmbed],
+        files: [pending.fichier.url],
+      });
+      await voteMessage.react('✅');
+    } catch (err) {
+      logger.error('submitModal: failed to post vote message', { error: err.message, userId: interaction.user.id });
+      await InteractionHelper.safeEditReply(interaction, {
+        embeds: [buildEmbed('❌ Erreur', "Impossible de publier la soumission.", getColor('error'))],
+      });
+      pendingSubmissions.delete(interaction.user.id);
+      return;
+    }
+
+    const collector = voteMessage.createReactionCollector({
+      filter: (reaction, user) => reaction.emoji.name === '✅' && !user.bot,
+      time: 24 * 60 * 60 * 1000,
+    });
+
+    collector.on('collect', async (reaction) => {
+      if (reaction.count - 1 >= pending.reactsRequis) {
+        collector.stop('threshold_reached');
+
+        const finalEmbed = buildEmbed(
+          'Soumission validée',
+          `**Description :** ${description}\n**Preuve :** ${preuve}\n**Auteur :** <@${interaction.user.id}>`,
+          getColor('success'),
+        );
+
+        try {
+          await pending.salon.send({
+            embeds: [finalEmbed],
+            files: [pending.fichier.url],
+          });
+          await voteMessage.reply(`✅ Seuil atteint, publié dans ${pending.salon}.`);
+        } catch (err) {
+          logger.error('submitModal: failed to post final submission', { error: err.message });
+        }
+      }
+    });
+
+    pendingSubmissions.delete(interaction.user.id);
+
+    await InteractionHelper.safeEditReply(interaction, {
+      embeds: [buildEmbed('✅ Soumission créée', "En attente de validation communautaire.", getColor('success'))],
+    });
+
+    logger.info('Submit modal processed', {
+      guildId: interaction.guildId,
+      userId: interaction.user.id,
+    });
   },
 };
